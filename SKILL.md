@@ -1,9 +1,9 @@
 ---
-name: prompt-logger
-description: Install, verify, or uninstall a Claude Code hook that logs every submitted prompt to a centralized JSONL file at ~/.claude/prompt-log.jsonl, tagged with timestamp, repo name, and machine name — and optionally export that log to a human-readable Markdown file at any location, such as an Obsidian vault. Use when the user asks to set up prompt logging, track/save Claude Code prompts, build a prompt history or audit trail, sync prompts into Obsidian/notes, or mentions wanting a centralized, readable record of what they've asked Claude Code across projects.
+name: clio
+description: Install, verify, or uninstall a Claude Code hook that logs every submitted prompt to a centralized JSONL file at ~/.claude/prompt-log.jsonl, tagged with timestamp, repo name, git branch, and machine name — and optionally export that log to a human-readable Markdown file at any location, such as an Obsidian vault. Use when the user asks to set up prompt logging, track/save Claude Code prompts, build a prompt history or audit trail, sync prompts into Obsidian/notes, or mentions wanting a centralized, readable record of what they've asked Claude Code across projects.
 ---
 
-# Prompt Logger
+# CLIO
 
 Installs a `UserPromptSubmit` hook (user-scope, applies to every repo) that appends
 one JSON line per submitted prompt to a single centralized file:
@@ -18,7 +18,7 @@ for up to 30s), so formatting happens later, on demand, not inline.
 
 One line per prompt:
 ```json
-{"timestamp":"2026-07-09T18:42:11Z","repo":"hypercart","machine":"Noels-MacBook-Pro","session_id":"abc123","prompt":"..."}
+{"timestamp":"2026-07-09T18:42:11Z","repo":"hypercart","branch":"main","machine":"Noels-MacBook-Pro","session_id":"abc123","prompt":"..."}
 ```
 
 ## Install
@@ -46,18 +46,19 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 repo=$(basename "$(git -C "$CLAUDE_PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null || echo "$CLAUDE_PROJECT_DIR")")
+branch=$(git -C "$CLAUDE_PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 machine=$(scutil --get ComputerName 2>/dev/null || hostname -s 2>/dev/null || hostname)
 
 # Strips auto-injected context blocks (ide_selection, system-reminder, local
 # command wrappers, etc.) so only what you actually typed gets logged.
 if ! echo "$input" | jq -c \
-  --arg ts "$ts" --arg repo "$repo" --arg machine "$machine" \
+  --arg ts "$ts" --arg repo "$repo" --arg branch "$branch" --arg machine "$machine" \
   '
   def clean_prompt:
     gsub("(?i)<(ide_selection|system-reminder|local-command-stdout|local-command-caveat|command-name|command-message|command-args|command-contents|function_results)[^>]*>.*?</\\1>"; ""; "gm")
     | gsub("\n[ \t]*\n[ \t]*\n+"; "\n\n")
     | sub("^\\s+"; "") | sub("\\s+$"; "");
-  {timestamp:$ts, repo:$repo, machine:$machine, session_id:.session_id, prompt:(.prompt | clean_prompt)}
+  {timestamp:$ts, repo:$repo, branch:$branch, machine:$machine, session_id:.session_id, prompt:(.prompt | clean_prompt)}
   ' \
   >> "$HOME/.claude/prompt-log.jsonl" 2>>"$errlog"; then
   echo "$ts failed to log prompt (malformed input?)" >> "$errlog"
@@ -133,7 +134,7 @@ reverse_lines() {
 new_entries=$(mktemp)
 tail -n +"$((LAST_LINE + 1))" "$JSONL" | reverse_lines | while IFS= read -r line; do
   echo "$line" | jq -r '
-    "## \(.repo | ascii_upcase)\n\(.timestamp)  \n\(.machine)\n\n> \"\(.prompt | gsub("\n"; "\n> "))\"\n"
+    "## \(.repo | ascii_upcase)\n\(.timestamp)  \n\(.machine)\(if (.branch // "") != "" then " · \(.branch)" else "" end)\n\n> \"\(.prompt | gsub("\n"; "\n> "))\"\n"
   '
 done > "$new_entries"
 
@@ -169,7 +170,7 @@ Each sync prepends entries like (newest at the top of the file):
 ## HYPERCART
 2026-07-09T18:42:11Z
 
-Noels-MacBook-Pro
+Noels-MacBook-Pro · main
 
 > "Help me refactor the wpdbtk delta-sync logic"
 ```
@@ -245,6 +246,7 @@ rm -f ~/.claude/hooks/prompt-log-to-md.sh ~/.claude/prompt-log-to-md.state ~/.cl
 
 - **Scope**: lives in `~/.claude/settings.json` (user-level), so one log file covers every repo — not project-local.
 - **`repo`**: git toplevel directory name; falls back to the project directory name if not a git repo.
+- **`branch`**: the checked-out branch at prompt time (`git rev-parse --abbrev-ref HEAD`); empty string if not a git repo or in detached HEAD with no symbolic ref. Recorded per-prompt so you can later tell which branch a given ask/change was made on, even after the branch is merged or deleted.
 - **`machine`**: macOS "Computer Name" (System Settings → General → Sharing), falling back to `hostname` on other platforms — useful once you're working across more than one machine.
 - **Timeout**: `UserPromptSubmit` hooks default to a 30s timeout; a plain append is instant and won't stall a session.
 - **Resumed sessions**: `--resume`/`--continue` replay saved context rather than re-running the hook for past turns — only genuinely new prompts get logged.
