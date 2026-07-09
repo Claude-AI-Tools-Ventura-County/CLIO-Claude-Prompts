@@ -21,6 +21,18 @@ If you use Claude Code across many repos and machines, there's no built-in way
 to see everything you've asked it over time. This gives you one append-only
 log you can grep, sync to notes, or just keep as an audit trail.
 
+## Use cases
+
+- **Cross-device recall.** You work on the same project from a laptop and a
+  desktop (or any multiple-device setup) and want to answer "where/when did I
+  ask Claude to do X on this project?" without digging through separate
+  session histories per machine.
+- **Cross-project AI memory, layered into a "second brain."** Point the
+  Markdown export at an Obsidian vault and, once that vault is vectorized/
+  indexed for retrieval, an AI assistant can search across *what you asked
+  Claude Code to do*, alongside your other notes — one more layer in a
+  multi-layered personal knowledge system, not just a flat log file.
+
 ## Requirements
 
 - macOS or Linux
@@ -29,3 +41,8 @@ log you can grep, sync to notes, or just keep as an audit trail.
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
+
+This project is provided **"AS IS," WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND**, either express or implied (Apache 2.0 §7). It runs on your machine
+with a hook that shells out and edits your Claude Code `settings.json` —
+read the scripts before running them, and use at your own risk.
