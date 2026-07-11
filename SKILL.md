@@ -94,33 +94,47 @@ tail -f ~/.claude/prompt-log.jsonl
 
 ## Optional: export to human-readable Markdown
 
-Converts the JSONL log into readable Markdown, newest entry first. Safe to re-run —
-it tracks a cursor and only processes entries added since the last run, so you can
-point a cron/launchd job at it or just run it by hand whenever you want to sync.
+Converts the JSONL log into readable Markdown, **rolled up by hour and grouped by
+repo** — every prompt from the same UTC hour and repo sits together instead of being
+interleaved. Newest hour first; within an hour, repos are alphabetical and prompts
+run in chronological order so each hour reads like a session.
+
+It **regenerates the whole file from the JSONL on every run** (no cursor/state), which
+makes it naturally idempotent: running it twice produces the identical file, and a
+prompt logged mid-hour lands in the right bucket on the next run. Machine-triggered
+relay turns (from `/relay-xyz` etc.) are filtered out so they never reach the doc —
+the raw JSONL still keeps them; they're only excluded from this rendered export.
 
 ```bash
 cat > ~/.claude/hooks/prompt-log-to-md.sh << 'EOF'
 #!/bin/bash
-# Converts ~/.claude/prompt-log.jsonl into a human-readable Markdown file.
-# Only processes entries logged since the last run (tracked in a small state file).
-# New entries are prepended (newest first), not appended.
+# Converts ~/.claude/prompt-log.jsonl into a human-readable Markdown file,
+# rolled up by UTC hour and grouped by repo within each hour.
+#
+# The whole file is rebuilt from the JSONL every run — it's a pure projection of
+# the log, so it's idempotent (re-running yields the same file, never duplicates).
 #
 # Usage: prompt-log-to-md.sh [output_md_path]
 # Default output: ~/.claude/prompt-log.md
+#
+# Filtering: prompts whose text matches PROMPT_LOG_EXCLUDE (a case-insensitive
+# regex) are omitted from the Markdown — used to drop machine-triggered relay
+# turns. Override it to widen/narrow what's hidden; set it empty to hide nothing.
 
 set -euo pipefail
 
 JSONL="$HOME/.claude/prompt-log.jsonl"
 OUT="${1:-$HOME/.claude/prompt-log.md}"
-STATE="$HOME/.claude/prompt-log-to-md.state"
+EXCLUDE_REGEX="${PROMPT_LOG_EXCLUDE:-file-based relay|cross-agent dependency drift}"
 
 [ -f "$JSONL" ] || { echo "No log yet at $JSONL"; exit 0; }
 
 mkdir -p "$(dirname "$OUT")"
 
-# Fixed header block kept at the top of the file: title, generator reminder,
-# then a "---" horizontal rule. The blank line before "---" is required so
-# Markdown renders a horizontal rule, not a setext (underlined) heading.
+# Fixed header block: title, generator reminder, then a "---" horizontal rule.
+# The blank line before "---" is required so Markdown renders a horizontal rule,
+# not a setext (underlined) heading. The whole file is rewritten each run, so the
+# header can never be duplicated.
 HEADER=$(printf '%s\n' \
   '# Claude Code Prompt Log' \
   '' \
@@ -128,51 +142,46 @@ HEADER=$(printf '%s\n' \
   'https://github.com/Claude-AI-Tools-Ventura-County/clio' \
   '' \
   '---')
-HEADER_LINES=6
 
-# Ensure the header exists exactly once. It's written on first creation, and
-# only *rebuilt* when the current top-of-file doesn't already match HEADER
-# (e.g. a file from an older version) — so repeated syncs never re-insert or
-# duplicate it. Entries always begin at the first "## " line, so everything
-# above that is treated as the (replaceable) header and the log is preserved.
-if [ ! -f "$OUT" ]; then
-  printf '%s\n' "$HEADER" > "$OUT"
-elif [ "$(head -n "$HEADER_LINES" "$OUT")" != "$HEADER" ]; then
-  body=$(sed -n '/^## /,$p' "$OUT")
-  { printf '%s\n' "$HEADER"; [ -n "$body" ] && printf '\n%s\n' "$body"; } > "$OUT"
-fi
+# Aggregate the whole log in one jq pass: filter excluded prompts, bucket by the
+# hour prefix of the UTC timestamp (newest hour first), then group by repo within
+# each hour and list that repo's prompts in chronological order.
+body=$(jq -rn --arg exclude "$EXCLUDE_REGEX" '
+  [inputs]
+  | (if ($exclude | length) > 0
+     then map(select((.prompt // "") | test($exclude; "i") | not))
+     else . end)
+  | map(. + {hk: (.timestamp | .[0:13])})          # "2026-07-11T06"
+  | group_by(.hk) | sort_by(.[0].hk) | reverse      # newest hour first
+  | map(
+      "## " + (.[0].hk | sub("T"; " ")) + ":00 UTC\n"
+      + ( group_by(.repo) | sort_by(.[0].repo)
+          | map(
+              "\n### " + ((.[0].repo // "unknown") | ascii_upcase) + "\n"
+              + ( sort_by(.timestamp)
+                  | map(
+                      "\n- `" + (.timestamp | .[11:19]) + "` · " + (.machine // "")
+                      + (if (.branch // "") != "" then " · " + .branch else "" end)
+                      + "\n\n  > \"" + ((.prompt // "") | gsub("\n"; "\n  > ")) + "\""
+                    )
+                  | join("\n") )
+              + "\n"
+            )
+          | join("") )
+    )
+  | join("\n")
+' "$JSONL")
 
-TOTAL_LINES=$(wc -l < "$JSONL" | tr -d ' ')
-LAST_LINE=$( [ -f "$STATE" ] && cat "$STATE" || echo 0 )
-
-if [ "$LAST_LINE" -ge "$TOTAL_LINES" ]; then
-  echo "Nothing new since last sync ($LAST_LINE/$TOTAL_LINES lines)."
-  exit 0
-fi
-
-reverse_lines() {
-  if command -v tac >/dev/null 2>&1; then tac; else tail -r; fi
-}
-
-new_entries=$(mktemp)
-tail -n +"$((LAST_LINE + 1))" "$JSONL" | reverse_lines | while IFS= read -r line; do
-  echo "$line" | jq -r '
-    "## \(.repo | ascii_upcase)\n\(.timestamp)  \n\(.machine)\(if (.branch // "") != "" then " · \(.branch)" else "" end)\n\n> \"\(.prompt | gsub("\n"; "\n> "))\"\n"
-  '
-done > "$new_entries"
-
-merged=$(mktemp)
+# Write atomically (temp file in the same dir, then mv) so a reader — e.g. Obsidian
+# — never sees a half-written file.
+tmp="$OUT.tmp.$$"
 {
-  head -n "$HEADER_LINES" "$OUT"
-  echo
-  cat "$new_entries"
-  tail -n +"$((HEADER_LINES + 1))" "$OUT"
-} > "$merged"
-mv "$merged" "$OUT"
-rm -f "$new_entries"
+  printf '%s\n' "$HEADER"
+  [ -n "$body" ] && printf '\n%s\n' "$body"
+} > "$tmp"
+mv "$tmp" "$OUT"
 
-echo "$TOTAL_LINES" > "$STATE"
-echo "✅ Synced $((TOTAL_LINES - LAST_LINE)) new prompt(s) to $OUT"
+echo "✅ Rebuilt $OUT"
 EOF
 
 chmod +x ~/.claude/hooks/prompt-log-to-md.sh
@@ -188,8 +197,9 @@ chmod +x ~/.claude/hooks/prompt-log-to-md.sh
 ~/.claude/hooks/prompt-log-to-md.sh ~/vault/_meta/prompt-log/prompt-log.md
 ```
 
-The file opens with a fixed header, and each sync prepends entries below it
-(newest first):
+The file opens with a fixed header, then one `## <hour>` section per UTC hour
+(newest first), and inside each hour a `### <REPO>` group listing that repo's
+prompts in order:
 ```markdown
 # Claude Code Prompt Log
 
@@ -198,15 +208,20 @@ https://github.com/Claude-AI-Tools-Ventura-County/clio
 
 ---
 
-## HYPERCART
-2026-07-09T18:42:11Z
+## 2026-07-09 18:00 UTC
 
-Noels-MacBook-Pro · main
+### HYPERCART
 
-> "Help me refactor the wpdbtk delta-sync logic"
+- `18:42:11` · Noels-MacBook-Pro · main
+
+  > "Help me refactor the wpdbtk delta-sync logic"
+
+- `18:55:03` · Noels-MacBook-Pro · main
+
+  > "Now add a regression test for it"
 ```
 
-To auto-sync on a schedule instead of running by hand, add it as a `launchd` job (macOS) or a cron entry pointing at the same command with your chosen output path — the script itself doesn't change either way.
+To roll up on a schedule instead of running by hand, add it as a `launchd` job (macOS) or a cron entry pointing at the same command with your chosen output path — the script itself doesn't change either way. Running it hourly gives you a per-hour digest that fills in as the hour progresses.
 
 ### Auto-sync every 5 minutes (macOS launchd)
 
@@ -282,7 +297,9 @@ rm -f ~/.claude/hooks/prompt-log-to-md.sh ~/.claude/prompt-log-to-md.state ~/.cl
 - **Timeout**: `UserPromptSubmit` hooks default to a 30s timeout; a plain append is instant and won't stall a session.
 - **Resumed sessions**: `--resume`/`--continue` replay saved context rather than re-running the hook for past turns — only genuinely new prompts get logged.
 - **Idempotent**: re-running the install block is safe; it skips re-registering the hook if it's already present, but always rewrites `log-prompt.sh`.
-- **MD export is a separate, pull-based step**: it reads the same JSONL and never touches the hook, so the two can be versioned, run, or dropped independently. Delete `prompt-log-to-md.state` if you ever want a full re-export instead of an incremental one.
+- **MD export is a separate, pull-based step**: it reads the same JSONL and never touches the hook, so the two can be versioned, run, or dropped independently. It's a pure projection of the log — the whole Markdown file is rebuilt from the JSONL each run, so there's no state to reset and re-running never duplicates anything.
+- **Hourly roll-up**: prompts are grouped by UTC hour (newest first) and by repo within each hour, so a repo's prompts from the same hour sit together instead of being interleaved. Hours are UTC to match the stored timestamps. A prompt logged mid-hour is folded into the correct bucket the next time the export runs.
+- **Relay/machine-prompt filtering**: prompts whose text matches `PROMPT_LOG_EXCLUDE` (default `file-based relay|cross-agent dependency drift`, case-insensitive) are omitted from the Markdown — this hides `/relay-xyz`-style machine-triggered turns. They stay in the raw JSONL; only the rendered export drops them. Override the env var to change what's hidden, or set it empty (`PROMPT_LOG_EXCLUDE= prompt-log-to-md.sh …`) to hide nothing.
 - **Errors are non-fatal but visible**: the hook always exits 0 so a logging failure never blocks a prompt from being submitted, but any failure (missing `jq`, malformed input) is recorded to `~/.claude/prompt-log-errors.log` instead of vanishing silently. Check that file if entries seem to be missing.
 - **Context stripping**: Claude Code's raw prompt field can include auto-injected blocks (`<ide_selection>`, `<system-reminder>`, local-command wrappers) alongside what you actually typed — e.g. having a file selected in your IDE dumps its contents into the prompt. The hook strips known wrapper tags before logging so entries stay a readable record of what you typed, not what the harness injected. jq's regex engine (Oniguruma) uses the `m` flag for dot-matches-newline, not `s` — that's intentional, not a typo.
 - **Uninstall matches the exact hook command, not a substring**: it compares each entry to the literal `$HOME/.claude/hooks/log-prompt.sh` string (unexpanded, matching exactly what install writes) rather than using `contains(...)`. A loose substring match would also strip an unrelated command that merely mentions "log-prompt.sh" in its text, and would miss this hook entirely if it were ever bundled into the same matcher block alongside another command at a non-zero array index.
