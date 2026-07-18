@@ -170,6 +170,7 @@ fi
 TOTAL_LINES=$(grep -c '' "$JSONL")
 LAST_LINE=$( [ -f "$STATE" ] && cat "$STATE" || echo 0 )
 case "$LAST_LINE" in ''|*[!0-9]*) LAST_LINE=0 ;; esac   # corrupt state → start over
+[ "$LAST_LINE" -gt "$TOTAL_LINES" ] && LAST_LINE=0      # JSONL shrank/rotated → re-emit all
 
 if [ "$LAST_LINE" -ge "$TOTAL_LINES" ]; then
   echo "Nothing new since last sync ($LAST_LINE/$TOTAL_LINES lines)."
@@ -191,7 +192,7 @@ tail -n +"$((LAST_LINE + 1))" "$JSONL" | reverse_lines | jq -Rr --arg exclude "$
 # atomically (temp + mv) so a reader like Obsidian never sees a half-written file.
 if [ -s "$new_entries" ]; then
   marker_line=$(grep -nF "$MARKER" "$OUT" | head -1 | cut -d: -f1)
-  merged=$(mktemp)
+  merged="$OUT.tmp.$$"   # same dir as $OUT so the mv is a true atomic rename
   {
     head -n "$marker_line" "$OUT"
     echo
