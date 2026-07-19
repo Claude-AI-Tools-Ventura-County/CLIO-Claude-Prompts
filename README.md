@@ -1,5 +1,9 @@
 # CLIO
 
+**Important Note:** This skill file is being deprecated/archived and active development will be pursued on the rebalanceOS repository.
+
+https://github.com/Hypercart-Dev-Tools/rebalance-OS
+
 A Claude Code skill that installs a `UserPromptSubmit` hook logging every prompt
 you submit — across every repo, on one machine — to a single centralized file:
 `~/.claude/prompt-log.jsonl`.
